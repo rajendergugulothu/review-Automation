@@ -1,6 +1,8 @@
+import hmac
+import os
 from collections import Counter
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header, HTTPException
 
 from app.database import get_reviews, get_review_status_rows
 from app.services.reminders import process_due_reminders
@@ -8,13 +10,25 @@ from app.services.reminders import process_due_reminders
 router = APIRouter()
 
 
+def _admin_secret_or_error(x_admin_secret: str | None) -> None:
+    expected_secret = os.getenv("ADMIN_API_SECRET", "").strip()
+    if not expected_secret:
+        raise HTTPException(status_code=503, detail="Admin API is not configured")
+
+    provided_secret = (x_admin_secret or "").strip()
+    if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+
 @router.get("/admin/reviews")
-def get_all_reviews():
+def get_all_reviews(x_admin_secret: str | None = Header(default=None)):
+    _admin_secret_or_error(x_admin_secret)
     return get_reviews(order_desc=True)
 
 
 @router.get("/admin/analytics")
-def review_analytics():
+def review_analytics(x_admin_secret: str | None = Header(default=None)):
+    _admin_secret_or_error(x_admin_secret)
     rows = get_reviews(order_desc=True)
     ratings = [row["rating"] for row in rows if row.get("rating")]
     total_requests = len(rows)
@@ -56,12 +70,14 @@ def review_analytics():
 
 
 @router.get("/admin/request-status-summary")
-def request_status_summary():
+def request_status_summary(x_admin_secret: str | None = Header(default=None)):
+    _admin_secret_or_error(x_admin_secret)
     rows = get_review_status_rows()
     statuses = [row.get("status") or "unknown" for row in rows]
     return dict(Counter(statuses))
 
 
 @router.post("/admin/process-reminders")
-def run_reminder_job():
+def run_reminder_job(x_admin_secret: str | None = Header(default=None)):
+    _admin_secret_or_error(x_admin_secret)
     return process_due_reminders()
