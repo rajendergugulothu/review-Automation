@@ -1,27 +1,92 @@
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 DB_PATH = Path(os.getenv("SQLITE_DB_PATH", "reviews.db")).resolve()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+SUPABASE_TABLE = os.getenv("SUPABASE_REVIEW_TABLE", "review_requests").strip() or "review_requests"
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _connect() -> sqlite3.Connection:
+def _using_supabase() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+
+def _supabase_headers(*, prefer: str | None = None) -> dict[str, str]:
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _supabase_request(
+    *,
+    method: str,
+    query: dict[str, str] | None = None,
+    payload: Any = None,
+    prefer: str | None = None,
+) -> Any:
+    if not _using_supabase():
+        raise RuntimeError("Supabase is not configured")
+
+    query_string = urlencode(query or {})
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    if query_string:
+        url = f"{url}?{query_string}"
+
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+
+    request = Request(url, data=body, method=method.upper())
+    for key, value in _supabase_headers(prefer=prefer).items():
+        request.add_header(key, value)
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            raw_body = response.read().decode("utf-8")
+            if not raw_body:
+                return None
+            return json.loads(raw_body)
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Supabase HTTP error {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Supabase network error: {exc}") from exc
+
+
+def _supabase_first_or_none(rows: Any) -> dict[str, Any] | None:
+    if isinstance(rows, list) and rows:
+        first = rows[0]
+        return first if isinstance(first, dict) else None
+    return None
+
+
+def _sqlite_connect() -> sqlite3.Connection:
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     return connection
 
 
-def _execute(
+def _sqlite_execute(
     query: str,
     params: tuple[Any, ...] = (),
     *,
@@ -29,7 +94,7 @@ def _execute(
     fetchall: bool = False,
     commit: bool = False,
 ) -> Any:
-    with _connect() as connection:
+    with _sqlite_connect() as connection:
         cursor = connection.execute(query, params)
         if commit:
             connection.commit()
@@ -42,7 +107,10 @@ def _execute(
 
 
 def init_db() -> None:
-    with _connect() as connection:
+    if _using_supabase():
+        return
+
+    with _sqlite_connect() as connection:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS review_requests (
@@ -95,10 +163,23 @@ def init_db() -> None:
 def insert_review_request(insert_data: dict[str, Any]) -> dict[str, Any]:
     payload = dict(insert_data)
     payload.setdefault("created_at", _utc_now_iso())
+
+    if _using_supabase():
+        rows = _supabase_request(
+            method="POST",
+            query={"select": "*"},
+            payload=payload,
+            prefer="return=representation",
+        )
+        row = _supabase_first_or_none(rows)
+        if not row:
+            raise RuntimeError("Supabase insert returned no row")
+        return row
+
     columns = ", ".join(payload.keys())
     placeholders = ", ".join("?" for _ in payload)
     values = tuple(payload.values())
-    row_id = _execute(
+    row_id = _sqlite_execute(
         f"INSERT INTO review_requests ({columns}) VALUES ({placeholders})",
         values,
         commit=True,
@@ -109,9 +190,23 @@ def insert_review_request(insert_data: dict[str, Any]) -> dict[str, Any]:
 def update_review_request_by_token(token: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     if not payload:
         return get_review_by_token(token)
+
+    if _using_supabase():
+        rows = _supabase_request(
+            method="PATCH",
+            query={
+                "unique_token": f"eq.{token}",
+                "select": "*",
+            },
+            payload=payload,
+            prefer="return=representation",
+        )
+        row = _supabase_first_or_none(rows)
+        return row if row else get_review_by_token(token)
+
     assignments = ", ".join(f"{column} = ?" for column in payload.keys())
     values = tuple(payload.values()) + (token,)
-    _execute(
+    _sqlite_execute(
         f"UPDATE review_requests SET {assignments} WHERE unique_token = ?",
         values,
         commit=True,
@@ -120,7 +215,18 @@ def update_review_request_by_token(token: str, payload: dict[str, Any]) -> dict[
 
 
 def get_review_by_token(token: str) -> dict[str, Any] | None:
-    return _execute(
+    if _using_supabase():
+        rows = _supabase_request(
+            method="GET",
+            query={
+                "select": "*",
+                "unique_token": f"eq.{token}",
+                "limit": "1",
+            },
+        )
+        return _supabase_first_or_none(rows)
+
+    return _sqlite_execute(
         "SELECT * FROM review_requests WHERE unique_token = ?",
         (token,),
         fetchone=True,
@@ -128,7 +234,18 @@ def get_review_by_token(token: str) -> dict[str, Any] | None:
 
 
 def get_review_by_id(row_id: int) -> dict[str, Any] | None:
-    return _execute(
+    if _using_supabase():
+        rows = _supabase_request(
+            method="GET",
+            query={
+                "select": "*",
+                "id": f"eq.{row_id}",
+                "limit": "1",
+            },
+        )
+        return _supabase_first_or_none(rows)
+
+    return _sqlite_execute(
         "SELECT * FROM review_requests WHERE id = ?",
         (row_id,),
         fetchone=True,
@@ -136,15 +253,33 @@ def get_review_by_id(row_id: int) -> dict[str, Any] | None:
 
 
 def get_reviews(order_desc: bool = True) -> list[dict[str, Any]]:
+    if _using_supabase():
+        order_direction = "desc" if order_desc else "asc"
+        rows = _supabase_request(
+            method="GET",
+            query={
+                "select": "*",
+                "order": f"created_at.{order_direction},id.{order_direction}",
+            },
+        )
+        return rows if isinstance(rows, list) else []
+
     direction = "DESC" if order_desc else "ASC"
-    return _execute(
+    return _sqlite_execute(
         f"SELECT * FROM review_requests ORDER BY datetime(created_at) {direction}, id {direction}",
         fetchall=True,
     )
 
 
 def get_review_status_rows() -> list[dict[str, Any]]:
-    return _execute("SELECT status FROM review_requests", fetchall=True)
+    if _using_supabase():
+        rows = _supabase_request(
+            method="GET",
+            query={"select": "status"},
+        )
+        return rows if isinstance(rows, list) else []
+
+    return _sqlite_execute("SELECT status FROM review_requests", fetchall=True)
 
 
 def find_review_by_external_event(
@@ -153,7 +288,21 @@ def find_review_by_external_event(
 ) -> dict[str, Any] | None:
     if not external_source or not external_event_id:
         return None
-    return _execute(
+
+    if _using_supabase():
+        rows = _supabase_request(
+            method="GET",
+            query={
+                "select": "*",
+                "external_source": f"eq.{external_source}",
+                "external_event_id": f"eq.{external_event_id}",
+                "order": "id.desc",
+                "limit": "1",
+            },
+        )
+        return _supabase_first_or_none(rows)
+
+    return _sqlite_execute(
         """
         SELECT * FROM review_requests
         WHERE external_source = ? AND external_event_id = ?
