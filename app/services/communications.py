@@ -3,9 +3,14 @@ import json
 import os
 import ssl
 import smtplib
+from functools import lru_cache
+from html import escape
 from email.message import EmailMessage
+from pathlib import Path
+from string import Template
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -14,6 +19,25 @@ import certifi
 
 def frontend_base_url() -> str:
     return os.getenv("FRONTEND_BASE_URL", "http://localhost:3000").rstrip("/")
+
+
+def public_review_request_url() -> str:
+    return os.getenv(
+        "PUBLIC_REVIEW_REQUEST_URL",
+        f"{frontend_base_url()}/office/urban-country-management",
+    ).strip()
+
+
+def public_asset_base_url() -> str:
+    configured_base = os.getenv("PUBLIC_ASSET_BASE_URL", "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+
+    parsed_url = urlparse(public_review_request_url())
+    if parsed_url.scheme and parsed_url.netloc:
+        return f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+    return frontend_base_url()
 
 
 def google_review_url() -> str:
@@ -33,7 +57,34 @@ def _smtp_config() -> dict[str, Any]:
     }
 
 
-def _send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
+@lru_cache(maxsize=1)
+def _review_request_email_template() -> Template:
+    template_path = Path(__file__).resolve().parent.parent / "templates" / "review_request_email.html"
+    return Template(template_path.read_text(encoding="utf-8"))
+
+
+def _review_request_email_html(
+    *,
+    review_link: str,
+    is_reminder: bool = False,
+    reminder_number: int | None = None,
+) -> str:
+    safe_link = escape(review_link, quote=True)
+    logo_url = escape(f"{public_asset_base_url()}/urban-country-logo.png", quote=True)
+
+    return _review_request_email_template().substitute(
+        logo_url=logo_url,
+        review_link=safe_link,
+    )
+
+
+def _send_email_smtp(
+    to_email: str,
+    subject: str,
+    body: str,
+    *,
+    html_body: str | None = None,
+) -> dict[str, Any]:
     cfg = _smtp_config()
     if not cfg["host"] or not cfg["from_email"]:
         return {
@@ -47,6 +98,8 @@ def _send_email_smtp(to_email: str, subject: str, body: str) -> dict[str, Any]:
     message["To"] = to_email
     message["Subject"] = subject
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
 
     try:
         tls_context = ssl.create_default_context(cafile=certifi.where())
@@ -165,9 +218,12 @@ def send_channel_message(
     if is_reminder and reminder_number:
         reminder_prefix = f"Reminder #{reminder_number}: "
 
+    outbound_link = public_review_request_url()
     message_text = (
-        f"{reminder_prefix}Hi {safe_name}, please share your review for Urban Country Realty: "
-        f"{review_link}"
+        f"{reminder_prefix}Dear Sir/Madam,\n\n"
+        "Thank you for choosing Urban Country Management. Please share your experience with us using the link below:\n\n"
+        f"{outbound_link}\n\n"
+        "Your feedback helps us improve our service."
     )
 
     channel_normalized = (channel or "").strip().lower()
@@ -185,10 +241,15 @@ def send_channel_message(
                 "provider": "smtp",
                 "detail": "Client email required for email channel",
             }
-        subject = "Urban Country Realty: Please share your review"
+        subject = "Urban Country Management: Please share your experience"
         if is_reminder and reminder_number:
-            subject = f"Reminder #{reminder_number}: Please share your review"
-        return _send_email_smtp(client_email, subject, message_text)
+            subject = "Urban Country Management: Please share your experience"
+        html_message = _review_request_email_html(
+            review_link=outbound_link,
+            is_reminder=is_reminder,
+            reminder_number=reminder_number,
+        )
+        return _send_email_smtp(client_email, subject, message_text, html_body=html_message)
 
     if not client_phone:
         return {
@@ -199,7 +260,10 @@ def send_channel_message(
 
     return _send_twilio_message(
         to_number=client_phone,
-        body=message_text,
+        body=(
+            f"{reminder_prefix}Dear Sir/Madam, please share your experience with Urban Country Management: "
+            f"{outbound_link}"
+        ),
         is_whatsapp=channel_normalized == "whatsapp",
     )
 
